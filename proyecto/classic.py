@@ -2,6 +2,9 @@ import pandas as pd
 import numpy as np
 import pickle
 
+from scipy import sparse
+
+from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import f1_score
@@ -84,21 +87,21 @@ class ClassicPunctuationCapitalizationModel:
 
         # Separate models for each task
         self.punct_initial_model = RandomForestClassifier(
-            n_estimators=100, random_state=0
+            n_estimators=80, random_state=0
         )
         self.punct_final_model = RandomForestClassifier(
-            n_estimators=100, random_state=0
+            n_estimators=80, random_state=0
         )
         self.capitalization_model = RandomForestClassifier(
-            n_estimators=100, random_state=0
+            n_estimators=80, random_state=0
         )
 
         # Vectorizers for categorical features
         self.vectorizers = {
-            "prev_token": TfidfVectorizer(max_features=1000),
-            "next_token": TfidfVectorizer(max_features=1000),
-            "prev_bigram": TfidfVectorizer(max_features=500),
-            "next_bigram": TfidfVectorizer(max_features=500),
+            "prev_token": HashingVectorizer(n_features=256, alternate_sign=False),
+            "next_token": HashingVectorizer(n_features=256, alternate_sign=False),
+            "prev_bigram": HashingVectorizer(n_features=128, alternate_sign=False),
+            "next_bigram": HashingVectorizer(n_features=128, alternate_sign=False),
         }
 
         self.is_fitted = False
@@ -122,6 +125,9 @@ class ClassicPunctuationCapitalizationModel:
 
             data.extend(inst_data)
 
+            if inst_id % 50_000 == 0:
+                print(f"… processed {inst_id} sentences")
+                
         df = pd.DataFrame(data, columns=["inst_id", "token_id", "token", "punt_inicial", "punt_final", "capitalizacion"])
 
         grouped = {}
@@ -135,10 +141,8 @@ class ClassicPunctuationCapitalizationModel:
 
         return list(grouped.values())
 
-
     def prepare_features(self, feature_dicts, fit_vectorizers=False):
-        """Convert feature dictionaries to numerical arrays"""
-        # Separate categorical and numerical features
+        """Convert feature dictionaries to numerical arrays, keeping sparse matrices."""
         categorical_features = [
             "prev_token",
             "next_token",
@@ -149,31 +153,34 @@ class ClassicPunctuationCapitalizationModel:
             k for k in feature_dicts[0].keys() if k not in categorical_features
         ]
 
-        # Handle numerical features
+        # Numerical features: dense
         X_numerical = np.array(
             [[fd.get(feat, 0) for feat in numerical_features] for fd in feature_dicts]
         )
 
-        # Handle categorical features
+        # Convert to sparse for hstack
+        X_numerical_sparse = sparse.csr_matrix(X_numerical)
+
+        # Categorical features: keep sparse
         X_categorical_parts = []
         for feat in categorical_features:
             feat_values = [fd.get(feat, "") for fd in feature_dicts]
 
             if fit_vectorizers:
-                X_feat = self.vectorizers[feat].fit_transform(feat_values).toarray()
+                X_feat = self.vectorizers[feat].fit_transform(feat_values)
             else:
-                X_feat = self.vectorizers[feat].transform(feat_values).toarray()
+                X_feat = self.vectorizers[feat].transform(feat_values)
 
             X_categorical_parts.append(X_feat)
 
-        # Combine all features
+        # Combine all
         if X_categorical_parts:
-            X_categorical = np.hstack(X_categorical_parts)
-            X = np.hstack([X_numerical, X_categorical])
+            X_all = sparse.hstack([X_numerical_sparse] + X_categorical_parts)
         else:
-            X = X_numerical
+            X_all = X_numerical_sparse
 
-        return X
+        return X_all
+
 
     def tokenize_and_get_ids(self, text):
         """Tokenize text and return tokens with their IDs"""
@@ -191,6 +198,7 @@ class ClassicPunctuationCapitalizationModel:
 
         self.feature_extractor.fit(training_data)
 
+        print("extracting token data")
         for instance in training_data:
             tokens = instance["tokens"]
             punct_initial = instance["punct_initial"]
@@ -210,8 +218,14 @@ class ClassicPunctuationCapitalizationModel:
         all_capitalization_num = [int(c) for c in all_capitalization]
 
         print("fitting models...")
+
+        print("fitting initial model")
         self.punct_initial_model.fit(X, all_punct_initial_num)
+
+        print("fitting final model")
         self.punct_final_model.fit(X, all_punct_final_num)
+
+        print("fitting capitalization model")
         self.capitalization_model.fit(X, all_capitalization_num)
 
         self.is_fitted = True
@@ -303,7 +317,7 @@ class ClassicPunctuationCapitalizationModel:
         while i < len(tokens):
             if not tokens[i].startswith("##"):
                 # Collect subtokens
-                word_tokens = [tokens[i]]
+                word_tokens = [tokens[i].replace("##", "")]
                 j = i + 1
                 while j < len(tokens) and tokens[j].startswith("##"):
                     word_tokens.append(tokens[j][2:])
@@ -312,27 +326,27 @@ class ClassicPunctuationCapitalizationModel:
 
                 # Apply capitalization
                 cap = capitalization[i]
-                if cap == 1:
-                    word = word.capitalize()
-                elif cap == 3:
+                if cap == 3:
                     word = word.upper()
+                elif cap == 1:
+                    word = word.capitalize()
                 elif cap == 2:
-                    # For mixed/other, leave as-is
-                    pass
-                # cap == 0 => lowercased
+                    if len(word) > 1:
+                        word = word[0].upper() + word[1:]
+                    else:
+                        word = word.upper()
                 else:
                     word = word.lower()
 
-                # Add initial punctuation
+                # Attach final punctuation
+                if punct_final[i]:
+                    word = word + punct_final[i]
+
+                # Prepend initial punctuation
                 if punct_initial[i]:
-                    words.append(punct_initial[i])
+                    word = punct_initial[i] + word
 
                 words.append(word)
-
-                # Add final punctuation
-                if punct_final[i]:
-                    words[-1] += punct_final[i]
-
                 i = j
             else:
                 i += 1

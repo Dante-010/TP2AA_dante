@@ -16,7 +16,7 @@ def main(mode: str, which: str):
         "es_419_validas.txt",
         train_ratio=0.8,
         val_ratio=0.1,
-        max_lines=10000
+        max_lines=1000
     )
 
     if mode == "train":
@@ -28,7 +28,7 @@ def main(mode: str, which: str):
             classic_model.save_model("classic_punct_model.pkl")
 
         if which in ("rnn", "birnn", "both"):
-            bidirectional = (which == "birnn" or which == "both")
+            bidirectional = (which == "birnn")
             rnn_model = RNNPunctuationCapitalizationModel(bidirectional=bidirectional)
             rnn_model.train(train_sentences, val_sentences, epochs=10)
             filename = "trained_birnn_model.pt" if bidirectional else "trained_rnn_model.pt"
@@ -47,7 +47,7 @@ def main(mode: str, which: str):
             print(classic_model.predict_and_reconstruct("cindy espero que estes muy orgullosa de lo que haz hecho"))
 
         if which in ("rnn", "birnn", "both"):
-            bidirectional = (which == "birnn" or which == "both")
+            bidirectional = (which == "birnn")
             rnn_model = RNNPunctuationCapitalizationModel(bidirectional=bidirectional)
             filename = "trained_birnn_model.pt" if bidirectional else "trained_rnn_model.pt"
             rnn_model.load_model(filename)

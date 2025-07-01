@@ -3,6 +3,8 @@ import torch.nn as nn
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
 
+import torch.optim.lr_scheduler
+from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from transformers import BertTokenizer, BertTokenizerFast
@@ -93,6 +95,8 @@ class RNNPunctuationCapitalizationModel:
         n_layers: int = 2,
         dropout: float = 0.1,
         learning_rate: float = 1e-3,
+        lr_scheduler_patience: int = 2,
+        early_stopping_patience: int = 3,
         batch_size: int = 128,
         bidirectional: bool = True,         
         device: Optional[torch.device] = None,
@@ -104,6 +108,8 @@ class RNNPunctuationCapitalizationModel:
         self.n_layers = n_layers
         self.dropout = dropout
         self.learning_rate = learning_rate
+        self.lr_scheduler_patience = lr_scheduler_patience
+        self.early_stopping_patience = early_stopping_patience
         self.batch_size = batch_size
         self.bidirectional = bidirectional
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -116,6 +122,7 @@ class RNNPunctuationCapitalizationModel:
         # Model and training components
         self.model = None
         self.optimizer = None
+        self.scheduler = None
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
         self.is_fitted = False
         
@@ -224,11 +231,22 @@ class RNNPunctuationCapitalizationModel:
         ).to(self.device)
         
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',         # Reduce LR when a monitored quantity has stopped decreasing
+            factor=0.5,         # Factor by which the learning rate will be reduced. new_lr = lr * factor
+            patience=self.lr_scheduler_patience, # Number of epochs with no improvement after which learning rate will be reduced.
+        )
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+
         print(f"Training on {self.device}")
         print(f"Train instances: {len(train_instances)}, Val: {len(val_instances)}")
         
         # Training loop
+        scaler = GradScaler("cuda")
+
         for epoch in range(1, epochs + 1):
             self.model.train()
             running_loss = 0.0
@@ -241,14 +259,20 @@ class RNNPunctuationCapitalizationModel:
                 cap_labs = cap_labs.to(self.device)
 
                 self.optimizer.zero_grad()
-                init_logits, final_logits, cap_logits = self.model(input_ids)
 
-                loss_init = self.criterion(init_logits.view(-1, self.num_init), init_labs.view(-1))
-                loss_final = self.criterion(final_logits.view(-1, self.num_final), final_labs.view(-1))
-                loss_cap = self.criterion(cap_logits.view(-1, self.num_cap), cap_labs.view(-1))
-                loss = loss_init + loss_final + loss_cap
-                loss.backward()
-                self.optimizer.step()
+                with autocast("cuda"):
+                    init_logits, final_logits, cap_logits = self.model(input_ids)
+
+                    loss_init = self.criterion(init_logits.view(-1, self.num_init), init_labs.view(-1))
+                    loss_final = self.criterion(final_logits.view(-1, self.num_final), final_labs.view(-1))
+                    loss_cap = self.criterion(cap_logits.view(-1, self.num_cap), cap_labs.view(-1))
+                    loss = loss_init + loss_final + loss_cap
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                scaler.step(self.optimizer)
+                scaler.update()
 
                 running_loss += loss.item()
                 n_batches += 1
@@ -256,15 +280,24 @@ class RNNPunctuationCapitalizationModel:
             avg_train_loss = running_loss / n_batches
             print(f"Epoch {epoch} — Train loss: {avg_train_loss:.4f}")
 
-            # Validation
-            self._validate(val_loader, epoch)
+            avg_val_loss = self._validate_and_return_loss(val_loader, epoch) # Call the new helper method
+            self.scheduler.step(avg_val_loss)
+
             print("-" * 60)
-        
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.early_stopping_patience:
+                    print(f"Early stopping triggered at epoch {epoch}.")
+                    break
+            
         self.is_fitted = True
         print("Training completed!")
 
-    def _validate(self, val_loader: DataLoader, epoch: int):
-        """Run validation and print metrics"""
+    def _validate_and_return_loss(self, val_loader: DataLoader, epoch: int) -> float:
         self.model.eval()
         val_loss = 0.0
         n_val_batches = 0
@@ -282,7 +315,6 @@ class RNNPunctuationCapitalizationModel:
 
                 init_logits, final_logits, cap_logits = self.model(input_ids)
 
-                # compute val loss
                 loss_init = self.criterion(init_logits.view(-1, self.num_init), init_labs.view(-1))
                 loss_final = self.criterion(final_logits.view(-1, self.num_final), final_labs.view(-1))
                 loss_cap = self.criterion(cap_logits.view(-1, self.num_cap), cap_labs.view(-1))
@@ -290,12 +322,10 @@ class RNNPunctuationCapitalizationModel:
                 val_loss += loss.item()
                 n_val_batches += 1
 
-                # get predictions
                 init_preds = init_logits.argmax(dim=-1)
                 final_preds = final_logits.argmax(dim=-1)
                 cap_preds = cap_logits.argmax(dim=-1)
 
-                # mask out padding (-100)
                 mask_init = init_labs.view(-1) != -100
                 mask_final = final_labs.view(-1) != -100
                 mask_cap = cap_labs.view(-1) != -100
@@ -310,13 +340,11 @@ class RNNPunctuationCapitalizationModel:
         avg_val_loss = val_loss / n_val_batches
         print(f"Epoch {epoch} — Val loss:   {avg_val_loss:.4f}")
 
-        # Compute macro-F1
         f1_init_macro = f1_score(all_init_trues, all_init_preds, average="macro", zero_division=0)
         f1_final_macro = f1_score(all_final_trues, all_final_preds, average="macro", zero_division=0)
         f1_cap_macro = f1_score(all_cap_trues, all_cap_preds, average="macro", zero_division=0)
         print(f"Epoch {epoch} — F1 (macro): init={f1_init_macro:.3f}, final={f1_final_macro:.3f}, cap={f1_cap_macro:.3f}")
 
-        # Per-class F1 reports
         print("\nInitial punctuation per-class F1:")
         print(classification_report(
             all_init_trues, all_init_preds,
@@ -334,6 +362,8 @@ class RNNPunctuationCapitalizationModel:
             all_cap_trues, all_cap_preds,
             labels=[0, 1, 2, 3], target_names=["lower", "Initial", "Mixed", "ALLCAP"], zero_division=0,
         ))
+        
+        return avg_val_loss
 
     def predict(self, text: str):
         """Predict punctuation and capitalization for input text"""
@@ -528,6 +558,8 @@ class RNNPunctuationCapitalizationModel:
             },
             "training_config": {
                 "learning_rate": self.learning_rate,
+                "lr_scheduler_patience": self.lr_scheduler_patience,
+                "early_stopping_patience": self.early_stopping_patience,
                 "batch_size": self.batch_size,
             },
             "is_fitted": self.is_fitted,
