@@ -7,7 +7,7 @@ from scipy import sparse
 from sklearn.feature_extraction.text import HashingVectorizer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import f1_score
+from sklearn.metrics import f1_score, classification_report
 
 from transformers import BertTokenizer
 
@@ -20,7 +20,6 @@ PUNCT_INITIAL_LABELS_INV = {v: k for k, v in PUNCT_INITIAL_LABELS.items()}
 
 PUNCT_FINAL_LABELS = {"": 0, ",": 1, ".": 2, "?": 3}
 PUNCT_FINAL_LABELS_INV = {v: k for k, v in PUNCT_FINAL_LABELS.items()}
-
 
 class FeatureExtractor:
     def __init__(self):
@@ -87,13 +86,13 @@ class ClassicPunctuationCapitalizationModel:
 
         # Separate models for each task
         self.punct_initial_model = RandomForestClassifier(
-            n_estimators=80, random_state=0
+            n_estimators=80, random_state=0, verbose=0
         )
         self.punct_final_model = RandomForestClassifier(
-            n_estimators=80, random_state=0
+            n_estimators=80, random_state=0, verbose=0
         )
         self.capitalization_model = RandomForestClassifier(
-            n_estimators=80, random_state=0
+            n_estimators=80, random_state=0, verbose=0
         )
 
         # Vectorizers for categorical features
@@ -380,6 +379,10 @@ class ClassicPunctuationCapitalizationModel:
         self.vectorizers = model_data["vectorizers"]
         self.is_fitted = model_data["is_fitted"]
 
+        self.punct_initial_model.verbose = False
+        self.punct_final_model.verbose = False
+        self.capitalization_model.verbose = False
+
         print(f"Model loaded from {filepath}")
 
 
@@ -530,6 +533,30 @@ def evaluate_model(model, test_data):
     print(f"Punctuation Initial F1: {pi_f1:.3f}")
     print(f"Punctuation Final F1: {pf_f1:.3f}")
     print(f"Capitalization F1: {cap_f1:.3f}")
+
+    print("Initial punctuation classification report:")
+    print(classification_report(
+        all_true_pi, all_pred_pi,
+        labels=list(PUNCT_INITIAL_LABELS.values()),
+        target_names=list(PUNCT_INITIAL_LABELS.keys()),
+        zero_division=0
+    ))
+
+    print("Final punctuation classification report:")
+    print(classification_report(
+        all_true_pf, all_pred_pf,
+        labels=list(PUNCT_FINAL_LABELS.values()),
+        target_names=list(PUNCT_FINAL_LABELS.keys()),
+        zero_division=0
+    ))
+
+    print("Capitalization classification report:")
+    print(classification_report(
+        all_true_cap, all_pred_cap,
+        labels=[0, 1, 2, 3],
+        target_names=["lower", "Initial", "Mixed", "ALLCAP"],
+        zero_division=0
+    ))
 
     return pi_f1, pf_f1, cap_f1
 

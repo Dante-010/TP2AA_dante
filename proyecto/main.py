@@ -16,7 +16,7 @@ def main(mode: str, which: str):
         "es_419_validas.txt",
         train_ratio=0.8,
         val_ratio=0.1,
-        max_lines=1000
+        max_lines=80000
     )
 
     if mode == "train":
@@ -41,10 +41,11 @@ def main(mode: str, which: str):
         if which in ("classic", "both"):
             classic_model = ClassicPunctuationCapitalizationModel()
             classic_model.load_model("classic_punct_model.pkl")
-            # evaluate_model(classic_model, classic_test_data)
+            a = evaluate_model(classic_model, classic_model._prepare_data(test_sentences))
             print(classic_model.predict_and_reconstruct("pasado mañana"))
             print(classic_model.predict_and_reconstruct("estás asustado"))
             print(classic_model.predict_and_reconstruct("cindy espero que estes muy orgullosa de lo que haz hecho"))
+            print(classic_model.predict_and_reconstruct("cómo estás"))
 
         if which in ("rnn", "birnn", "both"):
             bidirectional = (which == "birnn")
