@@ -1,2 +1,5 @@
 .vscode/
 es_419_validas.txt
+*.pt
+*.pkl
+*.pyc
