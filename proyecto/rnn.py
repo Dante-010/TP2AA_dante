@@ -372,54 +372,58 @@ class RNNPunctuationCapitalizationModel:
         
         return self.predict_and_reconstruct(text)
 
-    def predict_to_csv_from_dataframe(self, input_df: pd.DataFrame, output_file: str = "predictions.csv") -> pd.DataFrame:
+    def predict_and_fill_csv(self, input_df: pd.DataFrame, output_file: str = "predicted.csv") -> pd.DataFrame:
         """
-        Predicts on a dataframe with columns instancia_id, token_id, token
-        and outputs the same structure with predicted punt_inicial, punt_final, capitalización
+        Takes a dataframe with columns: instancia_id, token_id, token
+        Returns a new dataframe with added columns:
+        punt_inicial, punt_final, capitalización
+        One row per *input token* (same granularity).
         """
-        if not self.is_fitted:
-            raise ValueError("Model must be trained before prediction")
+        import pandas as pd
+        import torch
 
-        self.model.eval()
-        all_preds = []
+        results = []
+        tokenizer_fast = self.tokenizer_fast
+        device = self.device
 
-        for idx, row in input_df.iterrows():
-            inst_id = row["instancia_id"]
-            token_id = row["token_id"]
-            token = row["token"]
+        for instancia_id, group in input_df.groupby("instancia_id"):
+            # 1. Get the *input tokens exactly as they appear* (these are already subword tokens)
+            tokens = group["token"].tolist()
 
-            # NO further tokenization — treat this token exactly as given
-            token_id_bert = self.tokenizer.convert_tokens_to_ids(token)
-            input_ids = torch.tensor([[token_id_bert]], device=self.device)  # Shape [1,1]
+            # 2. Convert tokens to IDs using tokenizer's vocab
+            input_ids = tokenizer_fast.convert_tokens_to_ids(tokens)
+            input_ids_tensor = torch.tensor([input_ids], device=device)
 
+            # 3. Predict
+            self.model.eval()
             with torch.no_grad():
-                init_logits, final_logits, cap_logits = self.model(input_ids)
+                init_logits, final_logits, cap_logits = self.model(input_ids_tensor)
 
-            # Each logits is [1, 1, num_classes]
-            i_p = init_logits.argmax(dim=-1).item()
-            f_p = final_logits.argmax(dim=-1).item()
-            c_p = cap_logits.argmax(dim=-1).item()
+            # 4. Get predictions per token
+            init_pred = init_logits.argmax(dim=-1).squeeze(0).cpu().tolist()
+            final_pred = final_logits.argmax(dim=-1).squeeze(0).cpu().tolist()
+            cap_pred = cap_logits.argmax(dim=-1).squeeze(0).cpu().tolist()
 
-            punt_inicial = self.idx_map_init[i_p]
-            punt_final = self.idx_map_final[f_p]
+            # 5. Decode label indices
+            punt_inicial = [self.idx_map_init[idx] for idx in init_pred]
+            punt_final = [self.idx_map_final[idx] for idx in final_pred]
+            capitalizacion = cap_pred  # leave as integers or map if you want
 
-            # Ensure comma is in quotes
-            if punt_final == ",":
-                punt_final = '","'
+            # 6. Build output dataframe for this group
+            predicted_group = group.copy()
+            predicted_group["punt_inicial"] = punt_inicial
+            predicted_group["punt_final"] = punt_final
+            predicted_group["capitalización"] = capitalizacion
 
-            all_preds.append({
-                "instancia_id": inst_id,
-                "token_id": token_id,
-                "token": token,
-                "punt_inicial": punt_inicial,
-                "punt_final": punt_final,
-                "capitalización": c_p,
-            })
+            results.append(predicted_group)
 
-        output_df = pd.DataFrame(all_preds)
-        output_df.to_csv(output_file, index=False)
-        print(f"Wrote predictions to {output_file}")
-        return output_df
+        # Concatenate all
+        final_df = pd.concat(results, ignore_index=True)
+
+        if output_file:
+            final_df.to_csv(output_file, index=False)
+
+        return final_df
 
     def predict_and_reconstruct(self, raw_sentence: str) -> str:
         """
